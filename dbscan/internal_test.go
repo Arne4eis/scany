@@ -25,7 +25,7 @@ func DoTestRowScannerStartCalledExactlyOnce(t *testing.T, api *API, queryRows qu
 	mockStart.On("Execute", rs, mock.AnythingOfType("reflect.Value")).Return(nil).Run(func(args mock.Arguments) {
 		rs := args.Get(0).(*RowScanner)
 		rs.columns = []string{"foo", "bar"}
-		rs.columnToFieldIndex = map[string][]int{"foo": {0}, "bar": {1}}
+		rs.columnToFieldIndex = map[string]fieldMeta{"foo": {index: []int{0}}, "bar": {index: []int{1}}}
 		rs.scanFn = rs.scanStruct
 	})
 

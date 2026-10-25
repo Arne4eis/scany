@@ -15,6 +15,7 @@ import (
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 
+	"github.com/georgysavva/scany/v2/dbscan"
 	"github.com/georgysavva/scany/v2/pgxscan"
 )
 
@@ -42,6 +43,16 @@ const (
 	noRowsQuery = `
 		SELECT NULL AS foo, NULL AS bar LIMIT 0;
     `
+	postsWithAuthorsQuery = `
+		SELECT p.id AS id, a.id AS "author.id", a.name AS "author.name", a.bio AS "author.bio"
+		FROM (
+			VALUES ('post 1', 'author 1'), ('post 2', 'author 2'), ('post 3', NULL)
+		) AS p (id, author_id)
+		LEFT JOIN (
+			VALUES ('author 1', 'name 1', 'bio 1'), ('author 2', 'name 2', NULL)
+		) AS a (id, name, bio) ON a.id = p.author_id
+		ORDER BY p.id
+	`
 )
 
 func TestSelect(t *testing.T) {
@@ -214,8 +225,54 @@ func TestScanRow(t *testing.T) {
 	assert.Equal(t, expected, got)
 }
 
-func getAPI() (*pgxscan.API, error) {
-	dbscanAPI, err := pgxscan.NewDBScanAPI()
+type post struct {
+	ID     string
+	Author *author
+}
+
+type author struct {
+	ID   string
+	Name string
+	Bio  *string
+}
+
+func makeStrPtr(v string) *string { return &v }
+
+func TestSelect_withNilStructPointers(t *testing.T) {
+	t.Parallel()
+	api, err := getAPI(dbscan.WithNilStructPointers(true))
+	require.NoError(t, err)
+	expected := []*post{
+		{ID: "post 1", Author: &author{ID: "author 1", Name: "name 1", Bio: makeStrPtr("bio 1")}},
+		{ID: "post 2", Author: &author{ID: "author 2", Name: "name 2", Bio: nil}},
+		{ID: "post 3", Author: nil},
+	}
+
+	var got []*post
+	err = api.Select(ctx, testDB, &got, postsWithAuthorsQuery)
+	require.NoError(t, err)
+
+	assert.Equal(t, expected, got)
+}
+
+func TestGet_withNilStructPointers_NULLIntoNonPointerField_returnsErr(t *testing.T) {
+	t.Parallel()
+	api, err := getAPI(dbscan.WithNilStructPointers(true))
+	require.NoError(t, err)
+	query := `
+		SELECT 'post val' AS id, 'author id' AS "author.id", NULL::TEXT AS "author.name", NULL::TEXT AS "author.bio"
+	`
+	expectedErr := "scanning one: scanning: doing scan: scanFn: scany: column: 'author.name': " +
+		"cannot scan NULL into string: *pgxscan_test.author struct isn't nil because not all of its columns are NULL"
+
+	var got post
+	err = api.Get(ctx, testDB, &got, query)
+
+	assert.EqualError(t, err, expectedErr)
+}
+
+func getAPI(opts ...dbscan.APIOption) (*pgxscan.API, error) {
+	dbscanAPI, err := pgxscan.NewDBScanAPI(opts...)
 	if err != nil {
 		return nil, fmt.Errorf("new DB scan API: %w", err)
 	}

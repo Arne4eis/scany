@@ -109,6 +109,39 @@ and if the database library supports a type, dbscan supports it automatically, f
 User struct is valid, and every field will be scanned correctly, the only condition for this
 is that your database library can handle *string, CustomNullInt, CustomData and *CustomData types.
 
+NULL structs by pointer
+
+By default, dbscan initializes a nested or embedded struct by pointer if rows contain any of its columns,
+even if all their values are NULL. It doesn't fit structs that come from a LEFT JOIN:
+the joined row may be absent, and struct fields must be able to hold NULL in that case.
+Enable WithNilStructPointers option to set a struct by pointer to nil if all its columns are NULL, for example:
+
+	type Post struct {
+		ID     string
+		Author *User
+	}
+
+	type User struct {
+		ID    string
+		Email string
+		Bio   *string
+	}
+
+	// SELECT p.id, u.id AS "author.id", u.email AS "author.email", u.bio AS "author.bio"
+	// FROM posts p LEFT JOIN users u ON u.id = p.author_id
+
+Post.Author is nil if the post has no author, so User fields can have non-pointer types.
+If at least one column of the struct isn't NULL, dbscan initializes the struct and scans all its columns.
+For NULL columns, it follows the rules of database libraries: fields by pointer, interfaces, maps and slices
+are set to nil, types that implement sql.Scanner receive the NULL value via Scan method,
+and dbscan returns an error for other types.
+Structs by pointer can be nested into each other. dbscan sets a struct to nil only if all its columns are NULL,
+including columns of the nested structs.
+
+Note that dbscan can't distinguish an absent struct from a struct that has NULL in all its columns.
+It sets both to nil. Select at least one NOT NULL column of the struct, e.g. its primary key,
+to make the difference.
+
 Ignored struct fields
 
 In order for dbscan to work with a field, it must be exported. Unexported fields will be ignored.
