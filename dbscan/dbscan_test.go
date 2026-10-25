@@ -230,6 +230,64 @@ func TestScanAll_nonEmptySlice_resetsDestinationSlice(t *testing.T) {
 	assert.Equal(t, expected, got)
 }
 
+func TestScanAll_withNilStructPointers(t *testing.T) {
+	t.Parallel()
+	api, err := getAPI(dbscan.WithNilStructPointers(true))
+	require.NoError(t, err)
+	author1 := Author{ID: "author 1", Name: "name 1", Bio: makeStrPtr("bio 1")}
+	author2 := Author{ID: "author 2", Name: "name 2", Bio: nil}
+	cases := []struct {
+		name     string
+		dst      interface{}
+		expected interface{}
+	}{
+		{
+			name: "slice of structs",
+			dst:  &[]Post{},
+			expected: &[]Post{
+				{ID: "post 1", Author: &author1},
+				{ID: "post 2", Author: &author2},
+				{ID: "post 3", Author: nil},
+				{ID: "post 4", Author: &author1},
+			},
+		},
+		{
+			name: "slice of structs by ptr",
+			dst:  &[]*Post{},
+			expected: &[]*Post{
+				{ID: "post 1", Author: &author1},
+				{ID: "post 2", Author: &author2},
+				{ID: "post 3", Author: nil},
+				{ID: "post 4", Author: &author1},
+			},
+		},
+		{
+			name: "non-empty slice of structs",
+			dst: &[]Post{
+				{ID: "junk post 1", Author: &Author{ID: "junk author 1"}},
+				{ID: "junk post 2", Author: &Author{ID: "junk author 2"}},
+				{ID: "junk post 3", Author: &Author{ID: "junk author 3"}},
+			},
+			expected: &[]Post{
+				{ID: "post 1", Author: &author1},
+				{ID: "post 2", Author: &author2},
+				{ID: "post 3", Author: nil},
+				{ID: "post 4", Author: &author1},
+			},
+		},
+	}
+	for _, tc := range cases {
+		tc := tc
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+			rows := queryRows(t, postsWithAuthorsQuery)
+			err := api.ScanAll(tc.dst, rows)
+			require.NoError(t, err)
+			assert.Equal(t, tc.expected, tc.dst)
+		})
+	}
+}
+
 func TestScanAll_nonSliceDestination_returnsErr(t *testing.T) {
 	t.Parallel()
 	rows := queryRows(t, multipleRowsQuery)
@@ -391,6 +449,14 @@ func TestScanRow_withAllowUnknownColumns_unknownColumnType(t *testing.T) {
 
 	expected := struct{ Foo string }{Foo: "foo val"}
 	assert.Equal(t, expected, *got)
+}
+
+func TestNilStructPointers(t *testing.T) {
+	t.Parallel()
+	api, err := getAPI(dbscan.WithNilStructPointers(true))
+	require.NoError(t, err)
+	assert.True(t, api.NilStructPointers())
+	assert.False(t, testAPI.NilStructPointers())
 }
 
 func TestMain(m *testing.M) {

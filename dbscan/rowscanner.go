@@ -1,6 +1,7 @@
 package dbscan
 
 import (
+	"database/sql"
 	"fmt"
 	"reflect"
 )
@@ -29,12 +30,35 @@ type RowScanner struct {
 	api                *API
 	rows               Rows
 	columns            []string
-	columnToFieldIndex map[string][]int
+	columnToFieldIndex map[string]fieldMeta
 	mapElementType     reflect.Type
 	started            bool
 	scanFn             func(dstVal reflect.Value) error
 	start              startScannerFunc
 	scans              []any
+	ptrStructs         []*ptrStructScan
+	ptrStructColumns   []ptrStructColumn
+}
+
+// ptrStructScan holds the state of a struct by pointer for the current row, see WithNilStructPointers.
+type ptrStructScan struct {
+	index  []int
+	parent *ptrStructScan
+	// notNull is true if at least one column of the struct isn't NULL, including columns of nested structs.
+	notNull bool
+}
+
+// ptrStructColumn is a column that belongs to a struct by pointer.
+// It's scanned into a temporary value first to find out if the struct should be nil.
+type ptrStructColumn struct {
+	name   string
+	pos    int
+	index  []int
+	parent *ptrStructScan
+	// value is a pointer that the column is scanned into.
+	// It has *T type for a field of type T and the field type for a field by pointer.
+	value      reflect.Value
+	fieldByPtr bool
 }
 
 // NewRowScanner is a package-level helper function that uses the DefaultAPI object.
@@ -98,6 +122,9 @@ func startScanner(rs *RowScanner, dstValue reflect.Value) error {
 
 	if dstKind == reflect.Struct {
 		rs.columnToFieldIndex = rs.api.getColumnToFieldIndexMap(dstType)
+		if rs.api.nilStructPointers {
+			rs.preparePtrStructs(dstType)
+		}
 		rs.scanFn = rs.scanStruct
 		return nil
 	}
@@ -133,9 +160,12 @@ func (*noOpScanType) Scan(value interface{}) error {
 func (rs *RowScanner) scanStruct(structValue reflect.Value) error {
 	if rs.scans == nil {
 		rs.scans = make([]interface{}, len(rs.columns))
+		for _, column := range rs.ptrStructColumns {
+			rs.scans[column.pos] = column.value.Addr().Interface()
+		}
 	}
 	for i, column := range rs.columns {
-		fieldIndex, ok := rs.columnToFieldIndex[column]
+		field, ok := rs.columnToFieldIndex[column]
 		if !ok {
 			if rs.api.allowUnknownColumns {
 				var tmp noOpScanType
@@ -147,18 +177,143 @@ func (rs *RowScanner) scanStruct(structValue reflect.Value) error {
 				column, structValue.Type(),
 			)
 		}
+		if field.parent != nil && rs.api.nilStructPointers {
+			// The column is in rs.ptrStructColumns, it's scanned into a temporary value.
+			continue
+		}
 		// Struct may contain embedded structs by ptr that defaults to nil.
 		// In order to scan values into a nested field,
 		// we need to initialize all nil structs on its way.
-		initializeNested(structValue, fieldIndex)
+		initializeNested(structValue, field.index)
 
-		fieldVal := structValue.FieldByIndex(fieldIndex)
+		fieldVal := structValue.FieldByIndex(field.index)
 		rs.scans[i] = fieldVal.Addr().Interface()
+	}
+	for _, column := range rs.ptrStructColumns {
+		// The value might have been set to a field on the previous row,
+		// reset it, so the database library doesn't reuse it.
+		column.value.Set(reflect.Zero(column.value.Type()))
 	}
 	if err := rs.rows.Scan(rs.scans...); err != nil {
 		return fmt.Errorf("scany: scan row into struct fields: %w", err)
 	}
+	return rs.setPtrStructs(structValue)
+}
+
+// preparePtrStructs prepares columns that belong to structs by pointer to be scanned into temporary values.
+func (rs *RowScanner) preparePtrStructs(structType reflect.Type) {
+	known := make(map[*ptrStructMeta]*ptrStructScan)
+	for i, column := range rs.columns {
+		field, ok := rs.columnToFieldIndex[column]
+		if !ok || field.parent == nil {
+			continue
+		}
+		fieldType := structType.FieldByIndex(field.index).Type
+		fieldByPtr := fieldType.Kind() == reflect.Ptr
+		valueType := fieldType
+		if !fieldByPtr {
+			valueType = reflect.PtrTo(fieldType)
+		}
+		rs.ptrStructColumns = append(rs.ptrStructColumns, ptrStructColumn{
+			name:       column,
+			pos:        i,
+			index:      field.index,
+			parent:     rs.addPtrStruct(field.parent, known),
+			value:      reflect.New(valueType).Elem(),
+			fieldByPtr: fieldByPtr,
+		})
+	}
+}
+
+func (rs *RowScanner) addPtrStruct(meta *ptrStructMeta, known map[*ptrStructMeta]*ptrStructScan) *ptrStructScan {
+	if ptrStruct, ok := known[meta]; ok {
+		return ptrStruct
+	}
+	ptrStruct := &ptrStructScan{index: meta.index}
+	if meta.parent != nil {
+		ptrStruct.parent = rs.addPtrStruct(meta.parent, known)
+	}
+	known[meta] = ptrStruct
+	// Parent struct is always added before its nested structs.
+	rs.ptrStructs = append(rs.ptrStructs, ptrStruct)
+	return ptrStruct
+}
+
+// setPtrStructs sets structs by pointer to nil if all their columns are NULL,
+// otherwise it initializes them and sets their fields from the scanned temporary values.
+func (rs *RowScanner) setPtrStructs(structValue reflect.Value) error {
+	rs.markNotNullPtrStructs()
+	// Parent structs go first, so all structs on the way to the field are already initialized.
+	for _, ptrStruct := range rs.ptrStructs {
+		if ptrStruct.parent != nil && !ptrStruct.parent.notNull {
+			continue
+		}
+		field := structValue.FieldByIndex(ptrStruct.index)
+		if !ptrStruct.notNull {
+			field.Set(reflect.Zero(field.Type()))
+		} else if field.IsNil() {
+			field.Set(reflect.New(field.Type().Elem()))
+		}
+	}
+	for _, column := range rs.ptrStructColumns {
+		if !column.parent.notNull {
+			continue
+		}
+		field, err := structValue.FieldByIndexErr(column.index)
+		if err != nil {
+			// A column mapped to the struct by pointer itself has set it to nil,
+			// columns mapped to its fields are ignored then.
+			continue
+		}
+		switch {
+		case column.fieldByPtr:
+			field.Set(column.value)
+		case !column.value.IsNil():
+			field.Set(column.value.Elem())
+		default:
+			if err := column.setNULL(structValue, field); err != nil {
+				return err
+			}
+		}
+	}
 	return nil
+}
+
+// markNotNullPtrStructs marks structs by pointer that have at least one column that isn't NULL in the current row.
+// A column marks its struct and all parent structs.
+func (rs *RowScanner) markNotNullPtrStructs() {
+	for _, ptrStruct := range rs.ptrStructs {
+		ptrStruct.notNull = false
+	}
+	for _, column := range rs.ptrStructColumns {
+		if column.value.IsNil() {
+			continue
+		}
+		for ptrStruct := column.parent; ptrStruct != nil && !ptrStruct.notNull; ptrStruct = ptrStruct.parent {
+			ptrStruct.notNull = true
+		}
+	}
+}
+
+// setNULL sets NULL into a field that isn't a pointer, the same way as database libraries do:
+// sql.Scanner handles NULL itself, interfaces, maps and slices become nil, other types can't hold NULL.
+func (column *ptrStructColumn) setNULL(structValue, field reflect.Value) error {
+	if scanner, ok := field.Addr().Interface().(sql.Scanner); ok {
+		if err := scanner.Scan(nil); err != nil {
+			return fmt.Errorf("scany: column: '%s': scan NULL into %v: %w", column.name, field.Type(), err)
+		}
+		return nil
+	}
+	switch field.Kind() {
+	case reflect.Interface, reflect.Map, reflect.Slice:
+		field.Set(reflect.Zero(field.Type()))
+		return nil
+	default:
+		return fmt.Errorf(
+			"scany: column: '%s': cannot scan NULL into %v: %v struct isn't nil because not all of its columns are NULL",
+			column.name, field.Type(), structValue.FieldByIndex(column.parent.index).Type(),
+		)
+	}
 }
 
 func (rs *RowScanner) scanMap(mapValue reflect.Value) error {

@@ -9,22 +9,38 @@ type toTraverse struct {
 	Type         reflect.Type
 	IndexPrefix  []int
 	ColumnPrefix string
+	// Parent is the innermost struct by pointer that contains fields of Type, nil if there is none.
+	Parent *ptrStructMeta
 }
 
-func (api *API) getColumnToFieldIndexMap(structType reflect.Type) map[string][]int {
+// fieldMeta describes the struct field that a column is mapped to.
+type fieldMeta struct {
+	index []int
+	// parent is the innermost struct by pointer that contains the field, nil if there is none.
+	parent *ptrStructMeta
+}
+
+// ptrStructMeta describes a nested or embedded struct field by pointer.
+type ptrStructMeta struct {
+	index []int
+	// parent is the innermost struct by pointer that contains this struct, nil if there is none.
+	parent *ptrStructMeta
+}
+
+func (api *API) getColumnToFieldIndexMap(structType reflect.Type) map[string]fieldMeta {
 	resultIface, ok := api.columnToIndexFieldMapCache.Load(structType)
 	if ok {
-		return resultIface.(map[string][]int)
+		return resultIface.(map[string]fieldMeta)
 	}
 
 	result := api.buildColumnToFieldIndexMap(structType)
 	resultIface, _ = api.columnToIndexFieldMapCache.LoadOrStore(structType, result)
-	result = resultIface.(map[string][]int)
+	result = resultIface.(map[string]fieldMeta)
 	return result
 }
 
-func (api *API) buildColumnToFieldIndexMap(structType reflect.Type) map[string][]int {
-	result := make(map[string][]int, structType.NumField())
+func (api *API) buildColumnToFieldIndexMap(structType reflect.Type) map[string]fieldMeta {
+	result := make(map[string]fieldMeta, structType.NumField())
 	var queue []*toTraverse
 	queue = append(queue, &toTraverse{Type: structType, IndexPrefix: nil, ColumnPrefix: ""})
 	for len(queue) > 0 {
@@ -60,7 +76,7 @@ func (api *API) buildColumnToFieldIndexMap(structType reflect.Type) map[string][
 				column := api.buildColumn(traversal.ColumnPrefix, columnPart)
 
 				if _, exists := result[column]; !exists {
-					result[column] = index
+					result[column] = fieldMeta{index: index, parent: traversal.Parent}
 				}
 			}
 
@@ -76,10 +92,15 @@ func (api *API) buildColumnToFieldIndexMap(structType reflect.Type) map[string][
 					columnPart = dbTag
 				}
 				columnPrefix := api.buildColumn(traversal.ColumnPrefix, columnPart)
+				parent := traversal.Parent
+				if field.Type.Kind() == reflect.Ptr {
+					parent = &ptrStructMeta{index: index, parent: parent}
+				}
 				queue = append(queue, &toTraverse{
 					Type:         childType,
 					IndexPrefix:  index,
 					ColumnPrefix: columnPrefix,
+					Parent:       parent,
 				})
 			}
 		}

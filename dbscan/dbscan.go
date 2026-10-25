@@ -63,7 +63,8 @@ type API struct {
 	scannableTypesOption  []interface{}
 	scannableTypesReflect []reflect.Type
 	allowUnknownColumns   bool
-	// columnToIndexFieldMapCache stores a map of reflect.Type -> map[string][]int
+	nilStructPointers     bool
+	// columnToIndexFieldMapCache stores a map of reflect.Type -> map[string]fieldMeta
 	columnToIndexFieldMapCache sync.Map
 }
 
@@ -152,6 +153,17 @@ func WithAllowUnknownColumns(allowUnknownColumns bool) APIOption {
 	}
 }
 
+// WithNilStructPointers allows the scanner to leave a nested or embedded struct by pointer nil,
+// if all its columns are NULL in the current row. It is handy for structs that come from a LEFT JOIN.
+// If at least one column of the struct isn't NULL, the struct is initialized and filled as usual.
+// See "NULL structs by pointer" in the package documentation for details.
+// The default behavior is to initialize a struct by pointer if rows contain any of its columns.
+func WithNilStructPointers(nilStructPointers bool) APIOption {
+	return func(api *API) {
+		api.nilStructPointers = nilStructPointers
+	}
+}
+
 // StructTagKey returns the struct tag key used by the API.
 func (api *API) StructTagKey() string {
 	return api.structTagKey
@@ -166,6 +178,12 @@ func (api *API) ColumnSeparator() string {
 // db columns that doesn't exist at the destination.
 func (api *API) AllowUnknownColumns() bool {
 	return api.allowUnknownColumns
+}
+
+// NilStructPointers returns whether the scanner leaves a struct by pointer nil
+// if all its columns are NULL.
+func (api *API) NilStructPointers() bool {
+	return api.nilStructPointers
 }
 
 // ScanAll iterates all rows to the end. After iterating it closes the rows,

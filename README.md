@@ -28,6 +28,7 @@ it doesn't know anything about relations between objects e.g: one to many, many 
 - Custom database column name via struct tag
 - Reusing structs via nesting or embedding
 - NULLs and custom types support
+- Optional nil nested structs for LEFT JOIN results
 - Omitted struct fields
 - Apart from structs, support for maps and Go primitive types as the destination
 - Override default settings
